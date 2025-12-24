@@ -4,6 +4,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use csv::StringRecord;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use sha2::{Digest, Sha256};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -11,11 +12,19 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use uuid::Uuid;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum OutputFormat {
     Ndjson,
     Array,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum IdStrategy {
+    None,
+    Uuid,
+    Sha256,
 }
 
 #[derive(Parser, Debug)]
@@ -57,6 +66,10 @@ struct Args {
     /// Allow output records in any order (faster, less buffering)
     #[arg(long)]
     unordered: bool,
+
+    /// Add an id field to each output record
+    #[arg(long, value_enum, default_value = "none")]
+    id: IdStrategy,
 
     /// CSV delimiter character
     #[arg(long, default_value = ",")]
@@ -161,9 +174,10 @@ fn run_in_memory(args: &Args, delimiter: u8) -> io::Result<()> {
         .build()
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
+    let id_strategy = args.id;
     let json_rows: Vec<String> = pool.install(|| {
         rows.par_iter()
-            .map(|record| record_to_json(&headers, record))
+            .map(|record| record_to_json(&headers, record, id_strategy))
             .collect()
     });
 
@@ -172,8 +186,8 @@ fn run_in_memory(args: &Args, delimiter: u8) -> io::Result<()> {
     if args.verbose > 0 {
         eprintln!("Processed {} records", json_rows.len());
         eprintln!(
-            "Output format: {:?}, threads: {}, in-memory: true",
-            args.format, args.threads
+            "Output format: {:?}, threads: {}, in-memory: true, id: {:?}",
+            args.format, args.threads, args.id
         );
     }
 
@@ -209,7 +223,13 @@ fn run_streaming(args: &Args, delimiter: u8) -> io::Result<()> {
     let (result_tx, result_rx) = bounded::<ResultRow>(args.queue_size);
 
     let mut total_sent = 0u64;
-    spawn_workers(args.threads, job_rx, result_tx, Arc::clone(&headers));
+    spawn_workers(
+        args.threads,
+        job_rx,
+        result_tx,
+        Arc::clone(&headers),
+        args.id,
+    );
 
     if let Some(record) = first_record {
         send_record(&job_tx, total_sent, &record)?;
@@ -245,14 +265,16 @@ fn spawn_workers(
     job_rx: Receiver<Job>,
     result_tx: Sender<ResultRow>,
     headers: Arc<Vec<String>>,
+    id_strategy: IdStrategy,
 ) {
     for _ in 0..threads {
         let job_rx = job_rx.clone();
         let result_tx = result_tx.clone();
         let headers = Arc::clone(&headers);
+        let id_strategy = id_strategy;
         thread::spawn(move || {
             for job in job_rx.iter() {
-                let json = record_to_json(&headers, &job.record);
+                let json = record_to_json(&headers, &job.record, id_strategy);
                 let _ = result_tx.send(ResultRow {
                     index: job.index,
                     json,
@@ -262,8 +284,11 @@ fn spawn_workers(
     }
 }
 
-fn record_to_json(headers: &[String], record: &[String]) -> String {
+fn record_to_json(headers: &[String], record: &[String], id_strategy: IdStrategy) -> String {
     let mut map = Map::with_capacity(std::cmp::max(headers.len(), record.len()));
+    if let Some(id_value) = make_id(id_strategy, record) {
+        map.insert("id".to_string(), Value::String(id_value));
+    }
     for (idx, header) in headers.iter().enumerate() {
         let value = record.get(idx).cloned().unwrap_or_default();
         map.insert(header.clone(), Value::String(value));
@@ -325,8 +350,8 @@ fn write_output(args: &Args, result_rx: Receiver<ResultRow>, total_sent: u64) ->
     if args.verbose > 0 {
         eprintln!("Processed {} records", total_sent);
         eprintln!(
-            "Output format: {:?}, threads: {}, queue size: {}, unordered: {}",
-            args.format, args.threads, args.queue_size, args.unordered
+            "Output format: {:?}, threads: {}, queue size: {}, unordered: {}, id: {:?}",
+            args.format, args.threads, args.queue_size, args.unordered, args.id
         );
     }
 
@@ -356,6 +381,33 @@ fn parse_delimiter(value: &str) -> Result<u8, String> {
     }
     Err("delimiter must be a single byte character".to_string())
 }
+
+fn make_id(strategy: IdStrategy, record: &[String]) -> Option<String> {
+    match strategy {
+        IdStrategy::None => None,
+        IdStrategy::Uuid => Some(Uuid::new_v4().to_string()),
+        IdStrategy::Sha256 => Some(hash_record(record)),
+    }
+}
+
+fn hash_record(record: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for (idx, value) in record.iter().enumerate() {
+        if idx > 0 {
+            hasher.update([0x1f]);
+        }
+        hasher.update(value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 fn write_output_in_memory(args: &Args, rows: &[String]) -> io::Result<()> {
     let output: Box<dyn Write> = match &args.output {
