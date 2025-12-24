@@ -44,7 +44,7 @@ struct Args {
 
     /// CSV delimiter character
     #[arg(long, default_value = ",")]
-    delimiter: char,
+    delimiter: String,
 
     /// Verbosity (-v, -vv)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -77,15 +77,18 @@ fn main() -> io::Result<()> {
         eprintln!("queue-size must be at least 1");
         std::process::exit(2);
     }
-    if (args.delimiter as u32) > 0xFF {
-        eprintln!("delimiter must be a single byte character");
-        std::process::exit(2);
-    }
+    let delimiter = match parse_delimiter(&args.delimiter) {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
 
     let input = File::open(&args.input)?;
     let reader = BufReader::new(input);
     let mut csv_reader = csv::ReaderBuilder::new()
-        .delimiter(args.delimiter as u8)
+        .delimiter(delimiter)
         .has_headers(!args.no_headers)
         .flexible(true)
         .from_reader(reader);
@@ -117,7 +120,7 @@ fn main() -> io::Result<()> {
         total_sent += 1;
     }
 
-    let mut records_iter = csv_reader.into_records();
+    let records_iter = csv_reader.into_records();
     for record in records_iter {
         let record = record?;
         send_record(&job_tx, total_sent, &record)?;
@@ -239,6 +242,26 @@ fn write_output(args: &Args, result_rx: Receiver<ResultRow>, total_sent: u64) ->
 
 fn to_io_err(err: csv::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+fn parse_delimiter(value: &str) -> Result<u8, String> {
+    if value.is_empty() {
+        return Err("delimiter must be a single byte character".to_string());
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() == 1 {
+        return Ok(bytes[0]);
+    }
+    if value.starts_with('\\') && value.len() == 2 {
+        return match bytes[1] {
+            b't' => Ok(b'\t'),
+            b'n' => Ok(b'\n'),
+            b'r' => Ok(b'\r'),
+            b'\\' => Ok(b'\\'),
+            _ => Err("delimiter escape must be one of: \\t, \\n, \\r, \\\\".to_string()),
+        };
+    }
+    Err("delimiter must be a single byte character".to_string())
 }
 
 fn write_empty_output(args: &Args) -> io::Result<()> {
