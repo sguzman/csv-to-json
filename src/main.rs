@@ -1,6 +1,8 @@
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use csv::StringRecord;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -41,6 +43,14 @@ struct Args {
     /// Use when the CSV has no header row
     #[arg(long)]
     no_headers: bool,
+
+    /// Convert all rows in memory for maximum parallelism
+    #[arg(long)]
+    in_memory: bool,
+
+    /// Allow output records in any order (faster, less buffering)
+    #[arg(long)]
+    unordered: bool,
 
     /// CSV delimiter character
     #[arg(long, default_value = ",")]
@@ -85,6 +95,15 @@ fn main() -> io::Result<()> {
         }
     };
 
+    if args.in_memory {
+        run_in_memory(&args, delimiter)?;
+    } else {
+        run_streaming(&args, delimiter)?;
+    }
+    Ok(())
+}
+
+fn run_in_memory(args: &Args, delimiter: u8) -> io::Result<()> {
     let input = File::open(&args.input)?;
     let reader = BufReader::new(input);
     let mut csv_reader = csv::ReaderBuilder::new()
@@ -97,7 +116,70 @@ fn main() -> io::Result<()> {
     let headers = if args.no_headers {
         let mut record = StringRecord::new();
         if !csv_reader.read_record(&mut record).map_err(to_io_err)? {
-            write_empty_output(&args)?;
+            write_empty_output(args)?;
+            return Ok(());
+        }
+        let headers = (0..record.len())
+            .map(|idx| format!("col{}", idx + 1))
+            .collect::<Vec<_>>();
+        first_record = Some(record);
+        headers
+    } else {
+        load_headers(&mut csv_reader)?
+    };
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    if let Some(record) = first_record {
+        rows.push(record.iter().map(|s| s.to_string()).collect());
+    }
+    for record in csv_reader.into_records() {
+        let record = record?;
+        rows.push(record.iter().map(|s| s.to_string()).collect());
+    }
+
+    if rows.is_empty() {
+        write_empty_output(args)?;
+        return Ok(());
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+    let json_rows: Vec<String> = pool.install(|| {
+        rows.par_iter()
+            .map(|record| record_to_json(&headers, record))
+            .collect()
+    });
+
+    write_output_in_memory(args, &json_rows)?;
+
+    if args.verbose > 0 {
+        eprintln!("Processed {} records", json_rows.len());
+        eprintln!(
+            "Output format: {:?}, threads: {}, in-memory: true",
+            args.format, args.threads
+        );
+    }
+
+    Ok(())
+}
+
+fn run_streaming(args: &Args, delimiter: u8) -> io::Result<()> {
+    let input = File::open(&args.input)?;
+    let reader = BufReader::new(input);
+    let mut csv_reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(!args.no_headers)
+        .flexible(true)
+        .from_reader(reader);
+
+    let mut first_record = None;
+    let headers = if args.no_headers {
+        let mut record = StringRecord::new();
+        if !csv_reader.read_record(&mut record).map_err(to_io_err)? {
+            write_empty_output(args)?;
             return Ok(());
         }
         let headers = (0..record.len())
@@ -128,7 +210,7 @@ fn main() -> io::Result<()> {
     }
     drop(job_tx);
 
-    write_output(&args, result_rx, total_sent)?;
+    write_output(args, result_rx, total_sent)?;
     Ok(())
 }
 
@@ -193,31 +275,28 @@ fn write_output(args: &Args, result_rx: Receiver<ResultRow>, total_sent: u64) ->
         writer.write_all(b"[")?;
     }
 
-    let mut next_index = 0u64;
-    let mut buffered: BTreeMap<u64, String> = BTreeMap::new();
     let mut wrote_any = false;
+    let mut written = 0u64;
 
-    while let Ok(result) = result_rx.recv() {
-        buffered.insert(result.index, result.json);
-        while let Some(json) = buffered.remove(&next_index) {
-            match args.format {
-                OutputFormat::Ndjson => {
-                    writer.write_all(json.as_bytes())?;
-                    writer.write_all(b"\n")?;
-                }
-                OutputFormat::Array => {
-                    if wrote_any {
-                        writer.write_all(b",")?;
-                    }
-                    writer.write_all(json.as_bytes())?;
-                    wrote_any = true;
-                }
+    if args.unordered {
+        for result in result_rx.iter() {
+            write_json_value(&mut writer, args.format, &result.json, &mut wrote_any)?;
+            written += 1;
+        }
+    } else {
+        let mut next_index = 0u64;
+        let mut buffered: BTreeMap<u64, String> = BTreeMap::new();
+        while let Ok(result) = result_rx.recv() {
+            buffered.insert(result.index, result.json);
+            while let Some(json) = buffered.remove(&next_index) {
+                write_json_value(&mut writer, args.format, &json, &mut wrote_any)?;
+                next_index += 1;
+                written += 1;
             }
-            next_index += 1;
         }
     }
 
-    if next_index != total_sent {
+    if written != total_sent {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "failed to write all records",
@@ -232,8 +311,8 @@ fn write_output(args: &Args, result_rx: Receiver<ResultRow>, total_sent: u64) ->
     if args.verbose > 0 {
         eprintln!("Processed {} records", total_sent);
         eprintln!(
-            "Output format: {:?}, threads: {}, queue size: {}",
-            args.format, args.threads, args.queue_size
+            "Output format: {:?}, threads: {}, queue size: {}, unordered: {}",
+            args.format, args.threads, args.queue_size, args.unordered
         );
     }
 
@@ -262,6 +341,51 @@ fn parse_delimiter(value: &str) -> Result<u8, String> {
         };
     }
     Err("delimiter must be a single byte character".to_string())
+}
+
+fn write_output_in_memory(args: &Args, rows: &[String]) -> io::Result<()> {
+    let output: Box<dyn Write> = match &args.output {
+        Some(path) => Box::new(File::create(path)?),
+        None => Box::new(io::stdout()),
+    };
+    let mut writer = BufWriter::new(output);
+
+    if matches!(args.format, OutputFormat::Array) {
+        writer.write_all(b"[")?;
+    }
+
+    let mut wrote_any = false;
+    for json in rows {
+        write_json_value(&mut writer, args.format, json, &mut wrote_any)?;
+    }
+
+    if matches!(args.format, OutputFormat::Array) {
+        writer.write_all(b"]")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_json_value(
+    writer: &mut BufWriter<Box<dyn Write>>,
+    format: OutputFormat,
+    json: &str,
+    wrote_any: &mut bool,
+) -> io::Result<()> {
+    match format {
+        OutputFormat::Ndjson => {
+            writer.write_all(json.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        OutputFormat::Array => {
+            if *wrote_any {
+                writer.write_all(b",")?;
+            }
+            writer.write_all(json.as_bytes())?;
+            *wrote_any = true;
+        }
+    }
+    Ok(())
 }
 
 fn write_empty_output(args: &Args) -> io::Result<()> {
