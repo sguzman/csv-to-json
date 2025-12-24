@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use clap::builder::styling::{AnsiColor, Styles};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use csv::StringRecord;
 use rayon::prelude::*;
@@ -18,7 +19,12 @@ enum OutputFormat {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Convert CSV files to JSON with streaming output")]
+#[command(
+    author,
+    version,
+    about = "Convert CSV files to JSON with streaming output",
+    styles = cli_styles()
+)]
 struct Args {
     /// Input CSV file path
     #[arg(short, long)]
@@ -75,6 +81,14 @@ struct ResultRow {
 
 fn default_threads() -> usize {
     std::cmp::max(1, num_cpus::get())
+}
+
+fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Blue.on_default().bold())
+        .usage(AnsiColor::Green.on_default().bold())
+        .literal(AnsiColor::Cyan.on_default().bold())
+        .placeholder(AnsiColor::Yellow.on_default())
 }
 
 fn main() -> io::Result<()> {
